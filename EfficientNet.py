@@ -1,0 +1,180 @@
+import os
+import numpy as np
+from PIL import Image
+import torch
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as transforms
+import torch.optim as optim
+import torch.nn as nn
+from efficientnet_pytorch import EfficientNet
+import matplotlib.pyplot as plt
+from torch.cuda.amp import GradScaler, autocast
+
+class CustomDataset(Dataset):
+    def __init__(self, folder_path, transform=None):
+        self.folder_path = folder_path
+        self.transform = transform
+        self.image_paths = []
+        self.labels = []
+        for label in ['6', '9']:
+            folder = os.path.join(folder_path, label)
+            for filename in os.listdir(folder):
+                if filename.endswith('.jpg'):
+                    self.image_paths.append(os.path.join(folder, filename))
+                    self.labels.append(0 if label == '6' else 1)
+        print(f"Loaded {len(self.image_paths)} images from {folder_path}")
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        image = Image.open(img_path).convert('RGB')
+        label = self.labels[idx]
+        if self.transform:
+            image = self.transform(image)
+        return image, label
+
+def visualize_sample_images(dataset, num_images=5):
+    fig, axes = plt.subplots(1, num_images, figsize=(15, 5))
+    for i in range(num_images):
+        image, label = dataset[i]
+        image = image.permute(1, 2, 0).numpy()  # 转换为(H, W, C)格式
+        image = (image * 0.5 + 0.5) * 255  # 反归一化
+        axes[i].imshow(image.astype(np.uint8))
+        axes[i].set_title(f"Label: {label}")
+        axes[i].axis('off')
+    plt.show()
+
+# 图像预处理和数据增强
+train_transform = transforms.Compose([
+    transforms.Resize((64, 64)),
+    # transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(10),
+    # transforms.ColorJitter(brightness=0.1, contrast=0.4, saturation=0.4, hue=0.2),
+    transforms.RandomAffine(degrees=10, translate=(0.1, 0.1), scale=(0.8, 1.2)),
+    transforms.ToTensor(),
+    transforms.RandomErasing(p=0.15),  # 随机擦除部分图像
+    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+])
+
+test_transform = transforms.Compose([
+    transforms.Resize((64, 64)),
+    transforms.ToTensor(),
+    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+])
+
+train_dataset = CustomDataset('D:/runa/train_69/train', transform=train_transform)
+test_dataset = CustomDataset('D:/runa/train_69/test', transform=test_transform)
+
+# 可视化部分训练数据
+visualize_sample_images(train_dataset)
+
+train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False)
+
+class FineTunedEfficientNetB4(nn.Module):
+    def __init__(self):
+        super(FineTunedEfficientNetB4, self).__init__()
+        self.efficientnet = EfficientNet.from_pretrained('efficientnet-b4')
+        num_ftrs = self.efficientnet._fc.in_features
+        self.efficientnet._fc = nn.Linear(num_ftrs, 2)  # 修改最后一层分类层
+
+    def forward(self, x):
+        x = self.efficientnet(x)
+        return x
+
+# 检查是否有GPU可用
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+if __name__ == '__main__':
+    net = FineTunedEfficientNetB4()
+    net.to(device)  # 将模型移动到GPU
+
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    optimizer = optim.AdamW(net.parameters(), lr=0.1)  # 使用AdamW优化器
+    scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=0.001, steps_per_epoch=len(train_loader), epochs=50)
+
+    scaler = GradScaler()  # 混合精度训练的梯度缩放器
+
+    epoch_losses = []
+    train_accuracies = []
+    test_accuracies = []
+    num_epochs = 50  # 增加训练轮次
+
+    for epoch in range(num_epochs):
+        net.train()
+        running_loss = 0.0
+        correct = 0
+        total = 0
+        for i, data in enumerate(train_loader, 0):
+            inputs, labels = data
+            inputs, labels = inputs.to(device), labels.to(device)  # 将数据移动到GPU
+
+            optimizer.zero_grad()
+            with autocast():  # 使用自动混合精度
+               outputs = net(inputs)
+               loss = criterion(outputs, labels)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            running_loss += loss.item()
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+
+        epoch_loss = running_loss / len(train_loader)
+        epoch_losses.append(epoch_loss)
+        train_accuracy = 100 * correct / total
+        train_accuracies.append(train_accuracy)
+        print(f'Epoch {epoch + 1}, Average Loss: {epoch_loss:.4f}, Train Accuracy: {train_accuracy:.2f}%')
+
+        net.eval()
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for data in test_loader:
+                images, labels = data
+                images, labels = images.to(device), labels.to(device)  # 将数据移动到GPU
+                outputs = net(images)
+                _, predicted = torch.max(outputs.data, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+
+        test_accuracy = 100 * correct / total
+        test_accuracies.append(test_accuracy)
+        print(f'Epoch {epoch + 1}, Test Accuracy: {test_accuracy:.2f}%')
+
+    print('Finished Training')
+
+    plt.figure(figsize=(10, 5))
+    plt.subplot(1, 2, 1)
+    plt.plot(range(1, num_epochs + 1), epoch_losses, marker='o')
+    plt.title('Training Loss per Epoch')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.grid()
+
+    plt.subplot(1, 2, 2)
+    plt.plot(range(1, num_epochs + 1), train_accuracies, marker='o', label='Train Accuracy')
+    plt.plot(range(1, num_epochs + 1), test_accuracies, marker='x', label='Test Accuracy')
+    plt.title('Accuracy per Epoch')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.legend()
+    plt.grid()
+
+    plt.savefig('D:/runa/train_69/efficientnet_b4_training.png')
+    plt.show()
+
+    accuracy = test_accuracies[-1]
+    print(f'Final Accuracy of the network on the test images: {accuracy:.2f}%')
+
+    model_save_path = 'D:/runa/train_69/efficientnet_b4_model.pth'
+    torch.save({
+        'model_state_dict': net.state_dict(),
+        'accuracy': accuracy
+    }, model_save_path)
+    print(f'Model and accuracy saved to {model_save_path}')
